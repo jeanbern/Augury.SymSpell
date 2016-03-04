@@ -80,16 +80,40 @@ public class DictionaryItem
 
 internal sealed class SymmetricPredictor
 {
-// ReSharper disable ConvertToConstant.Local
-// These are tweaked manually by developers.
-    private readonly int _editDistanceMax = 1;
-    private readonly int _verbose = 2;
-    //0: top suggestion
-    //1: all suggestions of smallest edit distance 
-    //2: all suggestions <= editDistanceMax (slower, no early termination) - added early termination if Suggestions >= SuggestionsMin
-    private readonly bool _prefixDictionary = true;
-// ReSharper restore ConvertToConstant.Local
-        
+    internal SymmetricPredictor(SymmetricPredictorData data)
+    {
+        Dictionary = data.Dictionary;
+        Wordlist = data.Wordlist;
+    }
+
+    public Dictionary<string, double> PrefixLookup(string input, string language, int maxResults)
+    {
+        var maxDeletes = (input.Length - 1) / 3;
+
+        var deletes = maxDeletes < 1 ? new HashSet<string> { input } : Edits(input, maxDeletes, new HashSet<string>());
+        var resultPositions = new HashSet<string>();
+        foreach (var delete in deletes)
+        {
+            DictionaryItem di;
+            if (!Dictionary.TryGetValue(language + delete, out di)) {continue;}
+            foreach (var index in di.Suggestions)
+            {
+                resultPositions.Add(Wordlist[index]);
+            }
+        }
+
+        if (Wordlist.Contains(input)) { resultPositions.Add(input); }
+        maxResults = Math.Min(maxResults, resultPositions.Count);
+        //TODO: may want to use x.Count somewhere in the value section. Smoothing it would help. As of right now it's way too influential, so I'll let the Auger deal with frequency.
+        var res = resultPositions.ToDictionary(x => x, x => JaroWinkler.Distance(x, input)).OrderByDescending(x => x.Value).Take(maxResults).ToDictionary(x => x.Key, x => x.Value);
+        if (!res.ContainsKey(input))
+        {
+            res.Add(input, 1);
+        }
+
+        return res;
+    }
+
     internal SymmetricPredictor(IEnumerable<KeyValuePair<string, int>> strings, string language)
     {
         Console.Write("Creating dictionary ...");
@@ -100,8 +124,17 @@ internal sealed class SymmetricPredictor
         Wordlist.TrimExcess();
         stopWatch.Stop();
         Console.WriteLine("\rDictionary: " + wordCount.ToString("N0") + " words, " + Dictionary.Count.ToString("N0") +
-                            " entries, edit distance=" + _editDistanceMax + " in " + stopWatch.ElapsedMilliseconds + "ms " +
-                            (Process.GetCurrentProcess().PrivateMemorySize64 / 1000000).ToString("N0") + " MB");
+                          " entries in " + stopWatch.ElapsedMilliseconds + "ms " +
+                          (Process.GetCurrentProcess().PrivateMemorySize64 / 1000000).ToString("N0") + " MB");
+    }
+
+    internal SymmetricPredictorData ToData()
+    {
+        return new SymmetricPredictorData
+        {
+            Dictionary = Dictionary,
+            Wordlist = Wordlist
+        };
     }
 
     //Dictionary that contains both the original words and the deletes derived from them. A term might be both word and delete from another word at the same time.
@@ -111,8 +144,12 @@ internal sealed class SymmetricPredictor
 
     //List of unique words. By using the suggestions (Int) as index for this list they are translated into the original string.
     internal readonly List<string> Wordlist = new List<string>();
-        
-    internal int Maxlength = 0;//maximum dictionary term length
+
+    //Only include prefixes for words that show up at least x times.
+    private const int PrefixThreshold = 0;
+
+    //Only include edits for words that show up at least x times.
+    private const int IncludeThreshold = 0;
 
     //for every word there all deletes with an edit distance of 1..editDistanceMax created and added to the dictionary
     //every delete entry has a suggestions list, which points to the original term(s) it was created from
@@ -123,41 +160,55 @@ internal sealed class SymmetricPredictor
         DictionaryItem value;
         if (Dictionary.TryGetValue(language + key, out value))
         {
-            newFind = false;
-            //prevent overflow
-            if (value.Count < Int32.MaxValue - count)
+            if (value.Count == 0)
             {
-                value.Count += count;
+                //This would mean the word was added as a prefix or deletion for another.
+                //By assigning it a count we mark it a real word.
+                value.Count = count;
             }
             else
             {
-                value.Count = Int32.MaxValue;
+                //This shouldn't really ever happen. Our only constructor takes KeyValuePairs representing a word and it's count.
+                newFind = false;
+                //prevent overflow
+                if (value.Count < Int32.MaxValue - count)
+                {
+                    value.Count += count;
+                }
+                else
+                {
+                    value.Count = Int32.MaxValue;
+                }
             }
         }
         else if (Wordlist.Count < Int32.MaxValue)
         {
             value = new DictionaryItem { Count = count };
             Dictionary.Add(language + key, value);
-
-            if (key.Length > Maxlength) {Maxlength = key.Length;}
         }
         else
         {
             throw new OverflowException("The wordlist count would be greater than Int32.MaxValue, we can't add any more words.");
         }
-
+ja
         if (!newFind) return false;
 
         //edits/suggestions are created only once, no matter how often word occurs
         //edits/suggestions are created only as soon as the word occurs in the corpus, 
         //even if the same term existed before in the dictionary as an edit from another word
-        //a treshold might be specifid, when a term occurs so frequently in the corpus that it is considered a valid word for spelling correction
-        //word2index
         Wordlist.Add(key);
         var keyint = Wordlist.Count - 1;
 
+        //use a threshold so that very rare words are not corrected but will still count as correct when typed out
+        if (count < IncludeThreshold) return true;
+
+        //another threshold can be used to determine if a word shows up frequently enough to have it's prefixes included.
+        //It will still have a small amount of prefix guessing just due to possibility of having the deletes at the end.
+        //TODO: this could be a sliding scale so that longer words do not have super short prefixes included unless they are very common.
+        var minPrefixLength = count >= PrefixThreshold ? 0 : key.Length;
+        
         //create deletes
-        var edits = _prefixDictionary ? EditsOrPrefixes(key, _editDistanceMax, new HashSet<string>()) : Edits(key, _editDistanceMax, new HashSet<string>());
+        var edits = PrefixesAndDeletes(key, new HashSet<string>(), minPrefixLength);
         foreach (var delete in edits)
         {
             DictionaryItem di;
@@ -166,15 +217,14 @@ internal sealed class SymmetricPredictor
                 //already exists:
                 //1. word1==deletes(word2) 
                 //2. deletes(word1)==deletes(word2) 
-                //int or dictionaryItem? single delete existed before!
                 if (!di.Suggestions.Contains(keyint))
                 {
-                    AddLowestDistance(di, key, keyint, delete);
+                    di.AddSuggestion(keyint);
                 }
             }
             else
             {
-                di = new DictionaryItem { Count = 1 };
+                di = new DictionaryItem { Count = 0 };
                 di.AddSuggestion(keyint);
                 Dictionary.Add(language + delete, di);
             }
@@ -182,23 +232,17 @@ internal sealed class SymmetricPredictor
 
         return true;
     }
-        
-    //save some time and space
-    private void AddLowestDistance(DictionaryItem item, string suggestion, Int32 suggestionint, string delete)
+
+    private static IEnumerable<string> PrefixesAndDeletes(string word, HashSet<string> deletes, int minPrefixLength = 0)
     {
-
-        //remove all existing suggestions of higher distance, if verbose<2
-        //index2word
-        if ((_verbose < 2) && (item.Suggestions.Length > 0) && (Wordlist[item.Suggestions[0]].Length - delete.Length > suggestion.Length - delete.Length))
+        for (var x = word.Length; x >= minPrefixLength; x--)
         {
-            item.ClearSuggestions();
+            var prefix = word.Substring(0, x);
+            var maxDeletes = prefix.Length > 5 ? 2 : prefix.Length > 2 ? 1 : 0;
+            Edits(prefix, maxDeletes, deletes);
         }
 
-        //do not add suggestion of higher distance than existing, if verbose<2
-        if ((_verbose == 2) || (item.Suggestions.Length == 0) || (Wordlist[item.Suggestions[0]].Length - delete.Length >= suggestion.Length - delete.Length))
-        {
-            item.AddSuggestion(suggestionint);
-        }
+        return deletes;
     }
 
     //inexpensive and language independent: only deletes, no transposes + replaces + inserts
@@ -206,7 +250,7 @@ internal sealed class SymmetricPredictor
     private static HashSet<string> Edits(string word, int editDistanceRemaining, HashSet<string> deletes)
     {
         editDistanceRemaining--;
-        if (word.Length <= 1) { return deletes; }
+        if (word.Length <= 1 || editDistanceRemaining < 0) { return deletes; }
 
         for (var i = 0; i < word.Length; i++)
         {
@@ -219,188 +263,5 @@ internal sealed class SymmetricPredictor
         }
 
         return deletes;
-    }
-
-    private static HashSet<string> EditsOrPrefixes(string word, int editDistanceRemaining, HashSet<string> deletes)
-    {
-        if (word.Length <= 1) { return deletes; }
-
-        //Recursively go through all possible prefixes.
-        var prefix = word.Remove(word.Length - 1, 1);
-        if (deletes.Add(prefix))
-        {
-            EditsOrPrefixes(prefix, editDistanceRemaining, deletes);
-        }
-
-        //Recursively do the edits of the whole or prefix part.
-        //We can introduce some max edit distance according to word size. This will reduce time and memory requirements.
-        //TODO: make sure the modified max helps.
-        var modifiedEditDistanceRemaining = Math.Min(editDistanceRemaining, word.Length / 2);
-        if (modifiedEditDistanceRemaining > 0)
-        {
-            Edits(word, modifiedEditDistanceRemaining, deletes);
-        }
-
-        return deletes;
-    }
-
-    public List<string> PrefixLookup(string input, string language, int editDistanceMax, int maxResults)
-    {
-        DictionaryItem value;
-        var found = Dictionary.TryGetValue(language + input, out value);
-        if (!found)
-        {
-            //throw new NotImplementedException("I don't know what to do in this case. It hasn't shown up to blow things up yet.");
-            return new List<string>();
-        }
-
-        var suggestions = value.Suggestions.Select(x => Wordlist[x]);
-
-        //Only sort if we need to restrict amount - if you want them all and sorted, use int.Max
-        return (maxResults == -1 ? suggestions : suggestions.OrderByDescending(x => Dictionary[x].Count).Take(maxResults)).ToList();
-    }
-
-
-    public List<SuggestItem> Lookup(string input, string language, int editDistanceMax)
-    {
-        //save some time
-        if (input.Length - editDistanceMax > Maxlength) return new List<SuggestItem>();
-
-        var candidates = new List<string>();
-        var hashset1 = new HashSet<string>();
-
-        var suggestions = new List<SuggestItem>();
-        var hashset2 = new HashSet<string>();
-
-        //add original term
-        candidates.Add(input);
-
-        while (candidates.Count > 0)
-        {
-            var candidate = candidates[0];
-            candidates.RemoveAt(0);
-
-            //save some time
-            //early termination
-            //suggestion distance=candidate.distance... candidate.distance+editDistanceMax                
-            //if candidate distance is already higher than suggestion distance, than there are no better suggestions to be expected
-            if ((_verbose < 2) && (suggestions.Count > 0) && (input.Length - candidate.Length > suggestions[0].Distance))
-            {
-                return SortSuggestions(suggestions);
-            }
-
-            //read candidate entry from dictionary
-            DictionaryItem value;
-            if (Dictionary.TryGetValue(language + candidate, out value))
-            {
-
-                //if count>0 then candidate entry is correct dictionary term, not only delete item
-                if ((value.Count > 0) && hashset2.Add(candidate))
-                {
-                    //add correct dictionary term term to suggestion list
-                    var si = new SuggestItem(candidate)
-                    {
-                        Count = value.Count,
-                        Distance = input.Length - candidate.Length
-                    };
-
-                    suggestions.Add(si);
-                    //early termination
-                    if ((_verbose < 2) && (input.Length - candidate.Length == 0))
-                    {
-                        return SortSuggestions(suggestions);
-                    }
-                }
-
-                //iterate through suggestions (to other correct dictionary items) of delete item and add them to suggestion list
-                foreach (var suggestionint in value.Suggestions)
-                {
-                    //save some time 
-                    //skipping double items early: different deletes of the input term can lead to the same suggestion
-                    //index2word
-                    var suggestion = Wordlist[suggestionint];
-                    if (!hashset2.Add(suggestion)) { continue; }
-
-                    //True Damerau-Levenshtein Edit Distance: adjust distance, if both distances>0
-                    //We allow simultaneous edits (deletes) of editDistanceMax on on both the dictionary and the input term. 
-                    //For replaces and adjacent transposes the resulting edit distance stays <= editDistanceMax.
-                    //For inserts and deletes the resulting edit distance might exceed editDistanceMax.
-                    //To prevent suggestions of a higher edit distance, we need to calculate the resulting edit distance, if there are simultaneous edits on both sides.
-                    //Example: (bank==bnak and bank==bink, but bank!=kanb and bank!=xban and bank!=baxn for editDistanceMaxe=1)
-                    //Two deletes on each side of a pair makes them all equal, but the first two pairs have edit distance=1, the others edit distance=2.
-                    var distance = 0;
-                    if (suggestion != input)
-                    {
-                        if (suggestion.Length == candidate.Length)
-                        {
-                            distance = input.Length - candidate.Length;
-                        }
-                        else if (input.Length == candidate.Length)
-                        {
-                            distance = suggestion.Length - candidate.Length;
-                        }
-                        else
-                        {
-                            //https://github.com/jeanbern/SoftWx.Match/blob/master/SoftWx.Match/EditDistance.cs
-                            distance = EditDistance.Distance(suggestion, input, _editDistanceMax);
-                        }
-                    }
-
-                    //save some time.
-                    //remove all existing suggestions of higher distance, if verbose<2
-                    if ((_verbose < 2) && (suggestions.Count > 0) && (suggestions[0].Distance > distance))
-                    {
-                        suggestions.Clear();
-                    }
-
-                    //do not process higher distances than those already found, if verbose<2
-                    if ((_verbose < 2) && (suggestions.Count > 0) && (distance > suggestions[0].Distance)) { continue; }
-                    if (distance > editDistanceMax) { continue; }
-
-                    DictionaryItem value2;
-                    if (!Dictionary.TryGetValue(language + suggestion, out value2)) { continue; }
-
-                    var si = new SuggestItem(suggestion)
-                    {
-                        Count = value2.Count,
-                        Distance = distance
-                    };
-
-                    suggestions.Add(si);
-                }//end foreach
-            }//end if         
-
-            //add edits 
-            //derive edits (deletes) from candidate (input) and add them to candidates list
-            //this is a recursive process until the maximum edit distance has been reached
-            if (input.Length - candidate.Length >= editDistanceMax) { continue; }
-            //save some time
-            //do not create edits with edit distance smaller than suggestions already found
-            if ((_verbose < 2) && (suggestions.Count > 0) && (input.Length - candidate.Length >= suggestions[0].Distance)) { continue; }
-
-            candidates.AddRange(candidate.Select((t, i) => candidate.Remove(i, 1)).Where(hashset1.Add));
-        }//end while
-
-        //sort by ascending edit distance, then by descending word frequency
-        return SortSuggestions(suggestions);
-    }
-
-    private List<SuggestItem> SortSuggestions(List<SuggestItem> suggestions)
-    {
-        if (_verbose < 2)
-        {
-            suggestions.Sort((x, y) => -x.Count.CompareTo(y.Count));
-        }
-        else
-        {
-            suggestions.Sort((x, y) => 2 * x.Distance.CompareTo(y.Distance) - x.Count.CompareTo(y.Count));
-        }
-
-        if (_verbose == 0 && suggestions.Count > 1)
-        {
-            return suggestions.GetRange(0, 1);
-        }
-
-        return suggestions;
     }
 }
