@@ -1,228 +1,186 @@
-// Modified Version of symspell.
-// Used in conjunction with modified-Kneser-Ney prediction for auto-completion of text.
-
-// Copyright (C) 2015 Wolf Garbe
-// Version: 3.0
-// Author: Wolf Garbe <wolf.garbe@faroo.com>
-// Maintainer: Wolf Garbe <wolf.garbe@faroo.com>
-// URL: http://blog.faroo.com/2012/06/07/improved-edit-distance-based-spelling-correction/
-// Description: http://blog.faroo.com/2012/06/07/improved-edit-distance-based-spelling-correction/
-//
-// License:
-// This program is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License, 
-// version 3.0 (LGPL-3.0) as published by the Free Software Foundation.
-// http://www.opensource.org/licenses/LGPL-3.0
-//
-// Usage: single word + Enter:  Display spelling suggestions
-//        Enter without input:  Terminate the program
-
-
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 
-internal class DictionaryItem
+namespace Augury.Spelling
 {
-    public int[] Suggestions { get; set; }
-    public Int32 Count { get; set; }
-
-    public DictionaryItem()
-    {
-        Suggestions = new int[0];
-    }
-
-    public void ClearSuggestions()
-    {
-        Suggestions = new int[0];
-    }
-
-    public void AddSuggestion(int value)
-    {
-        var temp = Suggestions;
-        Suggestions = new int[temp.Length + 1];
-        for (var x = 0; x < temp.Length; x++)
-        {
-            Suggestions[x] = temp[x];
-        }
-
-        Suggestions[Suggestions.Length - 1] = value;
-    }
-}
-
     /// <see cref="http://github.com/jeanbern/symspell">
     /// Maintained in a branch to comply with licensing terms.
     /// </see>
     internal sealed class SymmetricPredictor
     {
-        public Dictionary<string, double> PrefixLookup(string input, string language, int maxResults)
+        public IEnumerable<WordSimilarityNode> PrefixLookup(string input, int maxResults)
         {
             var iLen = input.Length;
-            var maxDeletes = (input.Length - 1) / 3;
+            ICollection<string> possibleResults;
 
-            var deletes = maxDeletes < 1 ? new HashSet<string> { input } : Edits(input, maxDeletes, new HashSet<string>());
-            var resultPositions = new HashSet<string>();
-            foreach (var delete in deletes)
+            if (iLen < 4)
             {
-                DictionaryItem di;
-                if (!Dictionary.TryGetValue(language + delete, out di)) {continue;}
-                foreach (var word in di.Suggestions.Select(index => Wordlist[index]).Where(word => word.Length >= iLen))
+                HashSet<int> di;
+                if (!Dictionary.TryGetValue(input, out di))
                 {
-                    resultPositions.Add(word);
+                    return Wordlist.Contains(input) ? new[] {new WordSimilarityNode {Word = input, Similarity = 1.0}} : new WordSimilarityNode[0];
+                }
+
+                possibleResults = di.Select(index => Wordlist[index]).Where(word => word.Length >= iLen).ToList();
+                if (Wordlist.Contains(input)) { possibleResults.Add(input); }
+            }
+            else
+            {
+                possibleResults = new HashSet<string>();
+                var deletes = new HashSet<string>();
+                Edits(input, (iLen - 1)/3, deletes);
+                foreach (var delete in deletes)
+                {
+                    HashSet<int> di;
+                    if (!Dictionary.TryGetValue(delete, out di)) { continue; }
+                    foreach (var word in di.Select(index => Wordlist[index]).Where(word => word.Length >= iLen))
+                    {
+                        possibleResults.Add(word);
+                    }
                 }
             }
 
-            if (Wordlist.Contains(input)) { resultPositions.Add(input); }
-            maxResults = Math.Min(maxResults, resultPositions.Count);
-            //TODO: may want to use x.Count somewhere in the value section. Smoothing it would help. As of right now it's way too influential, so I'll let the Auger deal with frequency.
-            var res = resultPositions.ToDictionary(x => x, x => JaroWinkler.Distance(x, input)).OrderByDescending(x => x.Value/*Dictionary[x.Key].Count*/).Take(maxResults).ToDictionary(x => x.Key, x => x.Value);
-            return res;
+            if (possibleResults.Count <= maxResults)
+            {
+                return possibleResults.Select(word => new WordSimilarityNode { Word = word, Similarity = JaroWinkler.BoundedSimilarity(input, word) });
+            }
+
+            var max = Math.Min(possibleResults.Count, maxResults);
+
+            // SortedList.RemoveAt is O(n)
+            // SortedDictionary/SortedSet.ElementAt is O(n)
+            // So use the Queue!
+            var likelyWordsQueue = new WordSimilarityQueue(max);
+            var count = 0;
+            foreach (var word in possibleResults)
+            {
+                var jw = JaroWinkler.BoundedSimilarity(input, word);
+                if (count < max)
+                {
+                    ++count;
+                    likelyWordsQueue.Enqueue(word, jw);
+                }
+                else
+                {
+                    if (jw < likelyWordsQueue.First.Similarity) { continue; }
+                    likelyWordsQueue.Dequeue();
+                    likelyWordsQueue.Enqueue(word, jw);
+                }
+            }
+
+            return likelyWordsQueue;
         }
 
-        internal SymmetricPredictor(Dictionary<string, DictionaryItem> dictionary, List<string> wordlist)
+        internal SymmetricPredictor(Dictionary<string, HashSet<int>> dictionary, List<string> wordlist)
         {
             Dictionary = dictionary;
             Wordlist = wordlist;
         }
 
-        internal SymmetricPredictor(IEnumerable<KeyValuePair<string, int>> strings, string language)
+        internal SymmetricPredictor(IEnumerable<string> strings)
         {
             foreach (var key in strings)
             {
-                CreateDictionaryEntry(key.Key, language, key.Value);
+                CreateDictionaryEntry(key);
             }
             
             Wordlist.TrimExcess();
         }
-        
-        //Dictionary that contains both the original words and the deletes derived from them. A term might be both word and delete from another word at the same time.
-        //For space reduction a item might be either of type dictionaryItem or Int. 
-        //A dictionaryItem is used for word, word/delete, and delete with multiple suggestions. Int is used for deletes with a single suggestion (the majority of entries).
-        internal readonly Dictionary<string, DictionaryItem> Dictionary = new Dictionary<string, DictionaryItem>(); //initialisierung
 
-        //List of unique words. By using the suggestions (Int) as index for this list they are translated into the original string.
+        internal readonly Dictionary<string, HashSet<int>> Dictionary = new Dictionary<string, HashSet<int>>();
         internal readonly List<string> Wordlist = new List<string>();
 
-        //Only include prefixes for words that show up at least x times.
-        private const int PrefixThreshold = 0;
-
-        //Only include edits for words that show up at least x times.
-        private const int IncludeThreshold = 0;
-
-        //for every word there all deletes with an edit distance of 1..editDistanceMax created and added to the dictionary
-        //every delete entry has a suggestions list, which points to the original term(s) it was created from
-        //The dictionary may be dynamically updated (word frequency and new words) at any time by calling createDictionaryEntry
-        private bool CreateDictionaryEntry(string key, string language, int count = 1)
+        private void CreateDictionaryEntry(string key)
         {
-            var newFind = true;
-            DictionaryItem value;
-            if (Dictionary.TryGetValue(language + key, out value))
-            {
-                if (value.Count == 0)
-                {
-                    //This would mean the word was added as a prefix or deletion for another.
-                    //By assigning it a count we mark it a real word.
-                    value.Count = count;
-                }
-                else
-                {
-                    //This shouldn't really ever happen. Our only constructor takes KeyValuePairs representing a word and it's count.
-                    newFind = false;
-                    //prevent overflow
-                    if (value.Count < Int32.MaxValue - count)
-                    {
-                        value.Count += count;
-                    }
-                    else
-                    {
-                        value.Count = Int32.MaxValue;
-                    }
-                }
-            }
-            else if (Wordlist.Count < Int32.MaxValue)
-            {
-                value = new DictionaryItem { Count = count };
-                Dictionary.Add(language + key, value);
-            }
-            else
-            {
-                throw new OverflowException("The wordlist count would be greater than Int32.MaxValue, we can't add any more words.");
-            }
-
-            if (!newFind) return false;
-
-            //edits/suggestions are created only once, no matter how often word occurs
-            //edits/suggestions are created only as soon as the word occurs in the corpus, 
-            //even if the same term existed before in the dictionary as an edit from another word
             Wordlist.Add(key);
             var keyint = Wordlist.Count - 1;
 
-            //use a threshold so that very rare words are not corrected but will still count as correct when typed out
-            if (count < IncludeThreshold) {return true;}
+            HashSet<int> value;
+            if (!Dictionary.TryGetValue(key, out value))
+            {
+                value = new HashSet<int>();
+                Dictionary.Add(key, value);
+            }
 
-            //another threshold can be used to determine if a word shows up frequently enough to have it's prefixes included.
-            //It will still have a small amount of prefix guessing just due to possibility of having the deletes at the end.
-            //TODO: this could be a sliding scale so that longer words do not have super short prefixes included unless they are very common.
-            if (count < PrefixThreshold) {return true;}
             
-            //create deletes
-            var edits = PrefixesAndDeletes(key, new HashSet<string>(), 1);
+            var edits = PrefixesAndDeletes(key);
             foreach (var delete in edits)
             {
-                DictionaryItem di;
-                if (Dictionary.TryGetValue(language + delete, out di))
+                HashSet<int> di;
+                if (Dictionary.TryGetValue(delete, out di))
                 {
-                    //already exists:
-                    //1. word1==deletes(word2) 
-                    //2. deletes(word1)==deletes(word2) 
-                    if (!di.Suggestions.Contains(keyint))
-                    {
-                        di.AddSuggestion(keyint);
-                    }
+                    di.Add(keyint);
                 }
                 else
                 {
-                    di = new DictionaryItem { Count = 0 };
-                    di.AddSuggestion(keyint);
-                    Dictionary.Add(language + delete, di);
+                    di = new HashSet<int> {keyint};
+                    Dictionary.Add(delete, di);
                 }
             }
-
-            return true;
         }
 
-        private static IEnumerable<string> PrefixesAndDeletes(string word, HashSet<string> deletes, int minPrefixLength = 1)
+        private static IEnumerable<string> PrefixesAndDeletes(string word)
         {
-            for (var x = word.Length; x >= minPrefixLength; x--)
+            var wLen = word.Length;
+            switch (wLen)
             {
-                var prefix = word.Substring(0, x);
-                //maybe 5 instead of 4
-                var maxDeletes = prefix.Length > 4 ? 2 : prefix.Length > 1 ? 1 : 0;
-                Edits(prefix, maxDeletes, deletes);
+                case 0:
+                    return new List<string>();
+                case 1:
+                    return new List<string>();
+                case 2:
+                    return new List<string> {word[0].ToString()};
+                case 3:
+                    var deletes3 = new HashSet<string> {word[0].ToString()};
+                    Edits(word, 1, deletes3);
+                    return deletes3;
+                case 4:
+                    var deletes4 = new HashSet<string> {word[0].ToString()};
+                    Edits(word.Substring(0, 3), 1, deletes4);
+                    Edits(word, 1, deletes4);
+                    return deletes4;
+                default:
+                    var deletes = new HashSet<string> {word[0].ToString()};
+                    Edits(word.Substring(0, 3), 1, deletes);
+                    Edits(word.Substring(0, 4), 1, deletes);
+
+                    for (var x = wLen; x > 4; x--)
+                    {
+                        Edits(word.Substring(0, x), 2, deletes);
+                    }
+
+                    return deletes;
+            }
+        }
+
+        private static void Edits(string word, int editDistanceRemaining, ISet<string> deletes)
+        {
+            if (editDistanceRemaining == 0) { return; }
+
+            var wLen = word.Length;
+            if (wLen < 2) { return; }
+
+            if (editDistanceRemaining == 1)
+            {
+                for (var i = 0; i < wLen; i++)
+                {
+                    var delete = word.Remove(i, 1);
+                    deletes.Add(delete);
+                }
+
+                return;
             }
 
-            return deletes;
-        }
-
-        //inexpensive and language independent: only deletes, no transposes + replaces + inserts
-        //replaces and inserts are expensive and language dependent (Chinese has 70,000 Unicode Han characters)
-        private static HashSet<string> Edits(string word, int editDistanceRemaining, HashSet<string> deletes)
-        {
-            editDistanceRemaining--;
-            if (word.Length <= 1 || editDistanceRemaining < 0) { return deletes; }
-
-            for (var i = 0; i < word.Length; i++)
+            var newDistance = editDistanceRemaining - 1;
+            for (var i = 0; i < wLen; i++)
             {
                 var delete = word.Remove(i, 1);
-                if (deletes.Add(delete) && editDistanceRemaining > 0)
+                if (deletes.Add(delete))
                 {
-                    //recursion, if maximum edit distance not yet reached
-                    Edits(delete, editDistanceRemaining, deletes);
+                    Edits(delete, newDistance, deletes);
                 }
             }
-
-            return deletes;
         }
     }
 }
