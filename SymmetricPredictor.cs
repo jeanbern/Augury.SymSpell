@@ -8,22 +8,12 @@ using System.Linq;
 
 namespace Augury.SymSpell
 {
-    /// <summary>
-    /// Thanks to the IsRealWord bool, we can ensure no duplicate entries in WordList.
-    /// Other solutions require either a secondary Dictionary/HashSet/SortedList which contains the exact same strings as WordList.
-    /// This saves space and time.
-    /// </summary>
-    public class SymmetricEntry
-    {
-        public bool IsRealWord;
-        public List<int> Indices;
-    }
-
     /// <see cref="http://github.com/jeanbern/symspell">
     /// Maintained in a branch to comply with licensing terms.
     /// </see>
-    public sealed class SymmetricPredictor
+    public sealed class SymmetricPredictor : IPrefixLookup
     {
+        static IStringMetric _stringSimilarityProvider = new BoundedJaroWinkler();
 
         /// <summary>
         /// Finds possible corrections or extensions for a given word.
@@ -38,13 +28,13 @@ namespace Augury.SymSpell
 
             if (iLen < 3)
             {
-                SymmetricEntry di;
+                List<int> di;
                 if (!Dictionary.TryGetValue(input, out di))
                 {
                     return new WordSimilarityNode[0];
                 }
 
-                possibleResults = di.Indices.Select(index => Wordlist[index]).Where(word => word.Length >= iLen).ToList();
+                possibleResults = di.Select(index => Wordlist[index]).Where(word => word.Length >= iLen).ToList();
             }
             else
             {
@@ -58,17 +48,17 @@ namespace Augury.SymSpell
                 Edits(input, (iLen - 1) / 3, deletes);
                 foreach (var delete in deletes)
                 {
-                    SymmetricEntry di;
+                    List<int> di;
                     if (!Dictionary.TryGetValue(delete, out di)) { continue; }
-                    foreach (var word in di.Indices.Select(index => Wordlist[index]).Where(word => word.Length >= iLen))
+                    foreach (var word in di.Select(index => Wordlist[index]).Where(word => word.Length >= iLen))
                     {
                         possibleResults.Add(word);
                     }
                 }
             }
 
-            SymmetricEntry se;
-            if (Dictionary.TryGetValue(input, out se) && se.IsRealWord)
+            List<int> se;
+            if (Dictionary.TryGetValue(input, out se) && se.Any(x => Wordlist[x] == input))
             {
                 possibleResults.Add(input);
             }
@@ -76,7 +66,7 @@ namespace Augury.SymSpell
             //If we only have a small amount, we can sort them all.
             if (possibleResults.Count <= maxResults)
             {
-                return possibleResults.Select(word => new WordSimilarityNode { Word = word, Similarity = JaroWinkler.BoundedSimilarity(input, word) });
+                return possibleResults.Select(word => new WordSimilarityNode { Word = word, Similarity = _stringSimilarityProvider.Similarity(input, word) });
             }
 
             var max = Math.Min(possibleResults.Count, maxResults);
@@ -87,21 +77,10 @@ namespace Augury.SymSpell
             //SortedList.RemoveAt is O(n)
             //SortedDictionary/SortedSet.ElementAt is O(n)
             var likelyWordsQueue = new WordQueue(max);
-            var count = 0;
             foreach (var word in possibleResults)
             {
-                var jw = JaroWinkler.BoundedSimilarity(input, word);
-                if (count < max)
-                {
-                    ++count;
-                    likelyWordsQueue.Enqueue(word, jw);
-                }
-                else
-                {
-                    if (jw < likelyWordsQueue.First.Similarity) { continue; }
-                    likelyWordsQueue.Dequeue();
-                    likelyWordsQueue.Enqueue(word, jw);
-                }
+                var jw = _stringSimilarityProvider.Similarity(input, word);
+                likelyWordsQueue.Enqueue(word, jw);
             }
 
             return likelyWordsQueue;
@@ -112,7 +91,7 @@ namespace Augury.SymSpell
         /// </summary>
         /// <param name="dictionary"></param>
         /// <param name="wordlist"></param>
-        internal SymmetricPredictor(Dictionary<string, SymmetricEntry> dictionary, List<string> wordlist)
+        internal SymmetricPredictor(Dictionary<string, List<int>> dictionary, List<string> wordlist)
         {
             Dictionary = dictionary;
             Wordlist = wordlist;
@@ -132,38 +111,13 @@ namespace Augury.SymSpell
             Wordlist.TrimExcess();
         }
 
-        public void AddWordsNoSpelling(IEnumerable<string> strings)
-        {
-            foreach (var key in strings)
-            {
-                SymmetricEntry value;
-                if (Dictionary.TryGetValue(key, out value))
-                {
-                    if (value.IsRealWord)
-                    {
-                        //Already processed it.
-                        continue;
-                    }
-
-                    value.IsRealWord = true;
-                }
-                else
-                {
-                    value = new SymmetricEntry { IsRealWord = true, Indices = new List<int>() };
-                    Dictionary.Add(key, value);
-                }
-
-                Wordlist.Add(key);
-            }
-        }
-
         /// <summary>
         /// The Dictionary stores values in the following way:
         /// (key: prefix or misspelling, value: {int})
         /// The key is a string, it can be a valid word, a misspelling of a word, or a prefix (misspelt or not) of a word.
         /// The values represent indices in the WordList, each of these correspond to a word which has they key as either a prefix (spelled correctly or not), a mispelling, or as itself in the case of a proper word.
         /// </summary>
-        internal readonly Dictionary<string, SymmetricEntry> Dictionary = new Dictionary<string, SymmetricEntry>();
+        internal readonly Dictionary<string, List<int>> Dictionary = new Dictionary<string, List<int>>();
 
         /// <summary>
         /// Stores all known words. This saves space in the dictionary by using int (4 byte) to point to each string, instead of duplicating the string itself.
@@ -176,20 +130,14 @@ namespace Augury.SymSpell
         /// <param name="key">The new word.</param>
         internal void CreateSymmetricEntry(string key)
         {
-            SymmetricEntry value;
+            List<int> value;
             if (Dictionary.TryGetValue(key, out value))
             {
-                if (value.IsRealWord)
-                {
-                    //Already processed it.
-                    return;
-                }
-
-                value.IsRealWord = true;
+                return;
             }
             else
             {
-                value = new SymmetricEntry { IsRealWord = true, Indices = new List<int>() };
+                value = new List<int>();
                 Dictionary.Add(key, value);
             }
 
@@ -199,14 +147,14 @@ namespace Augury.SymSpell
             var edits = PrefixesAndDeletes(key);
             foreach (var delete in edits)
             {
-                SymmetricEntry di;
+                List<int> di;
                 if (Dictionary.TryGetValue(delete, out di))
                 {
-                    di.Indices.Add(keyint);
+                    di.Add(keyint);
                 }
                 else
                 {
-                    di = new SymmetricEntry { Indices = new List<int> { keyint } };
+                    di = new List<int> { keyint };
                     Dictionary.Add(delete, di);
                 }
             }
