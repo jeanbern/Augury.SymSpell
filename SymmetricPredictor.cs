@@ -1,5 +1,4 @@
 ﻿using Augury.Base;
-using Augury.Lucene;
 using Augury.PriorityQueue;
 using System;
 using System.Collections.Generic;
@@ -13,7 +12,7 @@ namespace Augury.SymSpell
     /// </see>
     public sealed class SymmetricPredictor : IPrefixLookup
     {
-        static IStringMetric _stringSimilarityProvider = new BoundedJaroWinkler();
+        static IStringMetric _stringSimilarityProvider;
 
         /// <summary>
         /// Finds possible corrections or extensions for a given word.
@@ -91,8 +90,9 @@ namespace Augury.SymSpell
         /// </summary>
         /// <param name="dictionary"></param>
         /// <param name="wordlist"></param>
-        internal SymmetricPredictor(Dictionary<string, List<int>> dictionary, List<string> wordlist)
+        internal SymmetricPredictor(Dictionary<string, List<int>> dictionary, List<string> wordlist, IStringMetric stringMetric)
         {
+            _stringSimilarityProvider = stringMetric;
             Dictionary = dictionary;
             Wordlist = wordlist;
         }
@@ -101,8 +101,9 @@ namespace Augury.SymSpell
         /// Will process a list of words into the Dictionary and WordList
         /// </summary>
         /// <param name="strings">The words in the corpus.</param>
-        public SymmetricPredictor(IEnumerable<string> strings)
+        public SymmetricPredictor(IEnumerable<string> strings, IStringMetric stringMetric)
         {
+            _stringSimilarityProvider = stringMetric;
             foreach (var key in strings)
             {
                 CreateSymmetricEntry(key);
